@@ -28,11 +28,11 @@ def run_fauxware(arch, threads):
     # step until the backdoor split occurs
     pg2 = pg.step(until=lambda lpg: len(lpg.active) > 1, step_func=lambda lpg: lpg.prune())
     nose.tools.assert_equal(len(pg2.active), 2)
-    nose.tools.assert_true(any("SOSNEAKY" in s for s in pg2.mp_active.posix.dumps(0).mp_items))
-    nose.tools.assert_false(all("SOSNEAKY" in s for s in pg2.mp_active.posix.dumps(0).mp_items))
+    nose.tools.assert_true(any(b"SOSNEAKY" in s for s in pg2.mp_active.posix.dumps(0).mp_items))
+    nose.tools.assert_false(all(b"SOSNEAKY" in s for s in pg2.mp_active.posix.dumps(0).mp_items))
 
     # separate out the backdoor and normal paths
-    pg3 = pg2.stash(lambda path: "SOSNEAKY" in path.posix.dumps(0), to_stash="backdoor").move('active', 'auth')
+    pg3 = pg2.stash(lambda path: b"SOSNEAKY" in path.posix.dumps(0), to_stash="backdoor").move('active', 'auth')
     nose.tools.assert_equal(len(pg3.active), 0)
     nose.tools.assert_equal(len(pg3.backdoor), 1)
     nose.tools.assert_equal(len(pg3.auth), 1)
@@ -79,15 +79,15 @@ def run_fauxware(arch, threads):
     total_active = len(pg_c.active)
 
     # test special stashes
-    nose.tools.assert_equals(len(pg_c.stashes['stashed']), 0)
+    nose.tools.assert_equal(len(pg_c.stashes['stashed']), 0)
     pg_d = pg_c.stash(filter_func=lambda p: p is pg_c.active[1], to_stash='asdf')
-    nose.tools.assert_equals(len(pg_d.stashes['stashed']), 0)
-    nose.tools.assert_equals(len(pg_d.asdf), 1)
-    nose.tools.assert_equals(len(pg_d.active), total_active-1)
+    nose.tools.assert_equal(len(pg_d.stashes['stashed']), 0)
+    nose.tools.assert_equal(len(pg_d.asdf), 1)
+    nose.tools.assert_equal(len(pg_d.active), total_active-1)
     pg_e = pg_d.stash(from_stash=pg_d.ALL, to_stash='fdsa')
-    nose.tools.assert_equals(len(pg_e.asdf), 0)
-    nose.tools.assert_equals(len(pg_e.active), 0)
-    nose.tools.assert_equals(len(pg_e.fdsa), total_active)
+    nose.tools.assert_equal(len(pg_e.asdf), 0)
+    nose.tools.assert_equal(len(pg_e.active), 0)
+    nose.tools.assert_equal(len(pg_e.fdsa), total_active)
     pg_f = pg_e.stash(from_stash=pg_e.ALL, to_stash=pg_e.DROP)
     nose.tools.assert_true(all(len(s) == 0 for s in pg_f.stashes.values()))
 
@@ -125,11 +125,11 @@ def test_explore_with_cfg():
 
 if __name__ == "__main__":
     logging.getLogger('angr.sim_manager').setLevel('DEBUG')
-    print 'explore_with_cfg'
+    print('explore_with_cfg')
     test_explore_with_cfg()
-    print 'find_to_middle'
+    print('find_to_middle')
     test_find_to_middle()
 
     for func, march, threads in test_fauxware():
-        print 'testing ' + march
+        print('testing ' + march)
         func(march, threads)

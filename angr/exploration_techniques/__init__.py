@@ -23,9 +23,9 @@ class ExplorationTechniqueMeta(type):
         return step_wrapped
 
     @staticmethod
-    def _filter_factory(filter):  # pylint:disable=redefined-builtin
+    def _filter_factory(func):  # pylint:disable=redefined-builtin
         def filter_wrapped(self, simgr, state, filter_func=None):
-            result = filter(self, state)  # pylint:disable=no-value-for-parameter
+            result = func(self, state)  # pylint:disable=no-value-for-parameter
             if result is None:
                 result = simgr.filter(state, filter_func=filter_func)
             return result
@@ -128,18 +128,18 @@ class ExplorationTechnique(object):
                             can be determined statically.
         """
         if condition is None:
-            condition_function = lambda p: default
+            condition_function = lambda state: default
             condition_function.addrs = set()
 
-        elif isinstance(condition, (int, long)):
+        elif isinstance(condition, int):
             return self._condition_to_lambda((condition,))
 
         elif isinstance(condition, (tuple, set, list)):
             addrs = set(condition)
-            def condition_function(p):
-                if p.addr in addrs:
-                    # returning {p.addr} instead of True to properly handle find/avoid conflicts
-                    return {p.addr}
+            def condition_function(state):
+                if state.addr in addrs:
+                    # returning {state.addr} instead of True to properly handle find/avoid conflicts
+                    return {state.addr}
 
                 if not isinstance(self.project.engines.default_engine, engines.SimEngineVEX):
                     return False
@@ -149,7 +149,7 @@ class ExplorationTechnique(object):
                     # not at the top of a block), check directly in the blocks
                     # (Blocks are repeatedly created for every check, but with
                     # the IRSB cache in angr lifter it should be OK.)
-                    return addrs.intersection(set(self.project.factory.block(p.addr).instruction_addrs))
+                    return addrs.intersection(set(state.block().instruction_addrs))
                 except (AngrError, SimError):
                     return False
             condition_function.addrs = addrs

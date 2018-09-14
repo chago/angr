@@ -59,7 +59,7 @@ class IdentifierCallable(object):
     def __call__(self, *args):
         self.perform_call(*args)
         if self.result_state is not None:
-            return self.result_state.se.simplify(self._cc.get_return_val(self.result_state, stack_base=self.result_state.regs.sp - self._cc.STACKARG_SP_DIFF))
+            return self.result_state.solver.simplify(self._cc.get_return_val(self.result_state, stack_base=self.result_state.regs.sp - self._cc.STACKARG_SP_DIFF))
         return None
 
     def get_base_state(self, *args):
@@ -86,7 +86,7 @@ class IdentifierCallable(object):
             return pg2
 
         caller = self._project.factory.simgr(state, immutable=True)
-        for _ in xrange(self._max_steps):
+        for _ in range(self._max_steps):
             if len(caller.active) == 0:
                 break
             if caller.active[0].history.block_count > 100000:

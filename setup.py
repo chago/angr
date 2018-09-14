@@ -41,7 +41,7 @@ def _build_native():
                 ('PYVEX_LIB_FILE', 'pyvex', 'lib\\pyvex.lib'))
     for var, pkg, fnm in env_data:
         try:
-            env[var] = pkg_resources.resource_filename(pkg, fnm).encode('ascii', 'ignore')
+            env[var] = pkg_resources.resource_filename(pkg, fnm)
         except KeyError:
             pass
 
@@ -104,7 +104,7 @@ setup(
         'cachetools',
         'capstone>=3.0.5rc2',
         'cooldict',
-        'dpkt-fix',
+        'dpkt',
         'futures; python_version == "2.7"',
         'mulpyplexer',
         'networkx>=2.0',

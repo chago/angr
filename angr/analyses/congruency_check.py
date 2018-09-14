@@ -283,10 +283,10 @@ class CongruencyCheck(Analysis):
         joint_solver = claripy.Solver()
 
         # make sure the canonicalized constraints are the same
-        n_map, n_counter, n_canon_constraint = claripy.And(*sr.se.constraints).canonicalize() #pylint:disable=no-member
-        u_map, u_counter, u_canon_constraint = claripy.And(*sl.se.constraints).canonicalize() #pylint:disable=no-member
-        n_canoner_constraint = sr.se.simplify(n_canon_constraint)
-        u_canoner_constraint = sl.se.simplify(u_canon_constraint)
+        n_map, n_counter, n_canon_constraint = claripy.And(*sr.solver.constraints).canonicalize() #pylint:disable=no-member
+        u_map, u_counter, u_canon_constraint = claripy.And(*sl.solver.constraints).canonicalize() #pylint:disable=no-member
+        n_canoner_constraint = sr.solver.simplify(n_canon_constraint)
+        u_canoner_constraint = sl.solver.simplify(u_canon_constraint)
         joint_solver.add((n_canoner_constraint, u_canoner_constraint))
         if n_canoner_constraint is not u_canoner_constraint:
             self._report_incongruency("Different constraints!")
@@ -324,13 +324,16 @@ class CongruencyCheck(Analysis):
 
         # make sure the flags are the same
         if sl.arch.name in ("AMD64", "X86", "ARM", "ARMEL", "ARMHF", "AARCH64"):
+            # pylint: disable=unused-variable
+            n_bkp = sr.regs.cc_op, sr.regs.cc_dep1, sr.regs.cc_dep2, sr.regs.cc_ndep
+            u_bkp = sl.regs.cc_op, sl.regs.cc_dep1, sl.regs.cc_dep2, sl.regs.cc_ndep
             if sl.arch.name in ('AMD64', 'X86'):
                 n_flags = sr.regs.eflags.canonicalize(var_map=n_map, counter=n_counter)[-1]
                 u_flags = sl.regs.eflags.canonicalize(var_map=u_map, counter=u_counter)[-1]
             else:
                 n_flags = sr.regs.flags.canonicalize(var_map=n_map, counter=n_counter)[-1]
                 u_flags = sl.regs.flags.canonicalize(var_map=u_map, counter=u_counter)[-1]
-            if n_flags is not u_flags and sl.se.simplify(n_flags) is not sr.se.simplify(u_flags):
+            if n_flags is not u_flags and sl.solver.simplify(n_flags) is not sr.solver.simplify(u_flags):
                 self._report_incongruency("Different flags!")
                 return False
 
