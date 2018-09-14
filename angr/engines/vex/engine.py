@@ -224,7 +224,6 @@ class SimEngineVEX(SimEngine):
         # if we've told the block to truncate before it ends, it will definitely have a default
         # exit barring errors
         has_default_exit = (last_stmt == 'default' or num_stmts <= last_stmt) and irsb.next is not None
->>>>>>> py3k
 
         # This option makes us only execute the last four instructions
         if o.SUPER_FASTPATH in state.options:
