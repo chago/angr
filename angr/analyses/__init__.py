@@ -4,12 +4,12 @@ from ..misc.ux import deprecated
 def register_analysis(cls, name):
     AnalysesHub.register_default(name, cls)
 
-from .cfg import CFGFast, CFGAccurate, CFG, CFGArchOptions
+from .cfg import CFGFast, CFGEmulated, CFG, CFGArchOptions
 from .cdg import CDG
 from .ddg import DDG
 from .vfg import VFG
 from .boyscout import BoyScout
-from .girlscout import GirlScout
+#from .girlscout import GirlScout
 from .backward_slice import BackwardSlice
 from .veritesting import Veritesting
 from .vsa_ddg import VSA_DDG
@@ -25,3 +25,7 @@ from .identifier import Identifier
 from .callee_cleanup_finder import CalleeCleanupFinder
 from .reaching_definitions import ReachingDefinitionAnalysis
 from .calling_convention import CallingConventionAnalysis
+from .code_tagging import CodeTagging
+from .stack_pointer_tracker import StackPointerTracker
+from .dominance_frontier import DominanceFrontier
+from .decompiler import Decompiler

@@ -4,7 +4,11 @@ from ....state_plugins.sim_action import SimActionData
 
 from . import SimIRStmt, SimStatementError
 
+
 class SimIRStmt_LoadG(SimIRStmt):
+
+    __slots__ = []
+
     def _execute(self):
         addr = self._translate_expr(self.stmt.addr)
         alt = self._translate_expr(self.stmt.alt)
@@ -26,7 +30,7 @@ class SimIRStmt_LoadG(SimIRStmt):
         else:
             raise SimStatementError("Unrecognized IRLoadGOp %s!" % self.stmt.cvt)
 
-        read_expr = self.state.se.If(guard.expr != 0, converted_expr, alt.expr)
+        read_expr = self.state.solver.If(guard.expr != 0, converted_expr, alt.expr)
 
         if o.ACTION_DEPS in self.state.options:
             reg_deps = addr.reg_deps() | alt.reg_deps() | guard.reg_deps()

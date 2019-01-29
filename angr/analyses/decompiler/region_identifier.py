@@ -6,10 +6,10 @@ import networkx
 from .. import Analysis, register_analysis
 from ...utils.graph import dfs_back_edges
 
-l = logging.getLogger('angr.analyses.region_identifier')
+l = logging.getLogger(name=__name__)
 
 
-class MultiNode(object):
+class MultiNode:
     def __init__(self, nodes):
         self.nodes = [ ]
 
@@ -40,7 +40,7 @@ class MultiNode(object):
         return self.nodes[0].addr
 
 
-class GraphRegion(object):
+class GraphRegion:
     def __init__(self, head, graph):
         self.head = head
         self.graph = graph
@@ -175,7 +175,11 @@ class RegionIdentifier(Analysis):
                 for src, dst in zip(simple_path, simple_path[1:]):
                     if include_frontier or (src not in frontier and dst not in frontier):
                         subgraph.add_edge(src, dst)
-
+        if not list(subgraph.nodes):
+            # HACK: FIXME: for infinite loop nodes, this would return an empty set, so we include the loop body itself
+            # Make sure this makes sense (EDG thinks it does)
+            if (node, node) in graph.edges:
+                subgraph.add_edge(node, node)
         return subgraph
 
     def _analyze(self):
@@ -193,7 +197,9 @@ class RegionIdentifier(Analysis):
 
         self._make_regions(graph)
 
-        assert len(graph.nodes()) == 1
+        if len(graph.nodes()) > 1:
+            l.warning("RegionIdentifier is unable to make one region out of the function graph of %s.",
+                      repr(self.function))
 
         self.region = next(iter(graph.nodes()))
 
@@ -243,7 +249,8 @@ class RegionIdentifier(Analysis):
         # TODO optimize
         latching_nodes = set([s for s,t in dfs_back_edges(graph, self._start_node) if t == head])
         loop_subgraph = self.slice_graph(graph, head, latching_nodes, include_frontier=True)
-        return set(loop_subgraph.nodes())
+        nodes = set(loop_subgraph.nodes())
+        return nodes
 
     @staticmethod
     def _dominates(idom, dominator_node, node):
@@ -319,15 +326,15 @@ class RegionIdentifier(Analysis):
             self._update_start_node(graph)
 
             for node in networkx.dfs_postorder_nodes(graph, source=self._start_node):
-                succs = graph.successors(node)
-                if not succs:
+                out_degree = graph.out_degree[node]
+                if out_degree == 0:
                     # the root element of the region hierarchy should always be a GraphRegion,
                     # so we transform it into one, if necessary
-                    if not graph.predecessors(node) and not isinstance(node, GraphRegion):
+                    if graph.in_degree(node) == 0 and not isinstance(node, GraphRegion):
                         subgraph = networkx.DiGraph()
                         subgraph.add_node(node)
                         self._abstract_acyclic_region(graph, GraphRegion(node, subgraph), [])
-                    break
+                    continue
 
                 # cyclic region
                 # TODO optimize
@@ -353,7 +360,8 @@ class RegionIdentifier(Analysis):
 
                     l.debug("Initial exit nodes %s", self._dbg_block_list(initial_exit_nodes))
 
-                    refined_loop_nodes, refined_exit_nodes = self._refine_loop(graph, node, initial_loop_nodes, initial_exit_nodes)
+                    refined_loop_nodes, refined_exit_nodes = self._refine_loop(graph, node, initial_loop_nodes,
+                                                                               initial_exit_nodes)
                     l.debug("Refined loop nodes %s", self._dbg_block_list(refined_loop_nodes))
                     l.debug("Refined exit nodes %s", self._dbg_block_list(refined_exit_nodes))
 
@@ -367,7 +375,8 @@ class RegionIdentifier(Analysis):
                         normal_exit_node = next(iter(refined_exit_nodes)) if len(refined_exit_nodes) > 0 else None
                         abnormal_exit_nodes = set()
 
-                    self._abstract_cyclic_region(graph, refined_loop_nodes, node, normal_entries, abnormal_entries, normal_exit_node, abnormal_exit_nodes)
+                    self._abstract_cyclic_region(graph, refined_loop_nodes, node, normal_entries, abnormal_entries,
+                                                 normal_exit_node, abnormal_exit_nodes)
                     break
                 # acyclic region
                 else:
@@ -576,7 +585,7 @@ class RegionIdentifier(Analysis):
 
     @staticmethod
     def _dbg_block_list(blocks):
-        return map(lambda block: hex(block.addr), blocks)
+        return [hex(b.addr) for b in blocks]
 
 
 register_analysis(RegionIdentifier, 'RegionIdentifier')

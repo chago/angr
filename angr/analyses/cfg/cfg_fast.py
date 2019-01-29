@@ -12,11 +12,12 @@ import cle
 import pyvex
 from cle.address_translator import AT
 
+from ...misc.ux import deprecated
 from .memory_data import MemoryData
 from .cfg_arch_options import CFGArchOptions
 from .cfg_base import CFGBase
 from .cfg_node import CFGNode
-from ..forward_analysis import ForwardAnalysis
+from ..forward_analysis import ForwardAnalysis, AngrSkipJobNotice
 from ... import sim_options as o
 from ...errors import (AngrCFGError, SimEngineError, SimMemoryError, SimTranslationError, SimValueError,
                        AngrUnsupportedSyscallError
@@ -24,10 +25,11 @@ from ...errors import (AngrCFGError, SimEngineError, SimMemoryError, SimTranslat
 
 VEX_IRSB_MAX_SIZE = 400
 
-l = logging.getLogger("angr.analyses.cfg.cfg_fast")
+
+l = logging.getLogger(name=__name__)
 
 
-class Segment(object):
+class Segment:
     """
     Representing a memory block. This is not the "Segment" in ELF memory model
     """
@@ -70,7 +72,7 @@ class Segment(object):
         return Segment(self.start, self.end, self.sort)
 
 
-class SegmentList(object):
+class SegmentList:
     """
     SegmentList describes a series of segmented memory blocks. You may query whether an address belongs to any of the
     blocks or not, and obtain the exact block(segment) that the address belongs to.
@@ -106,7 +108,7 @@ class SegmentList(object):
         end = len(self._list)
 
         while start != end:
-            mid = (start + end) / 2
+            mid = (start + end) // 2
 
             segment = self._list[mid]
             if addr < segment.start:
@@ -302,7 +304,7 @@ class SegmentList(object):
         old_sort = ""
         for segment in self._list:
             if segment.start <= old_end and segment.sort == old_sort:
-                raise Exception("Error in SegmentList: blocks are not merged")
+                raise AngrCFGError("Error in SegmentList: blocks are not merged")
             # old_start = start
             old_end = segment.end
             old_sort = segment.sort
@@ -420,7 +422,7 @@ class SegmentList(object):
         :return: None
         """
 
-        if size <= 0:
+        if size is None or size <= 0:
             # Cannot occupy a non-existent block
             return
 
@@ -448,6 +450,7 @@ class SegmentList(object):
 
         n._list = [ a.copy() for a in self._list ]
         n._bytes_occupied = self._bytes_occupied
+        return n
 
     #
     # Properties
@@ -474,7 +477,7 @@ class SegmentList(object):
         return len(self._list) > 0
 
 
-class FunctionReturn(object):
+class FunctionReturn:
     """
     FunctionReturn describes a function call in a specific location and its return location. Hashable and equatable
     """
@@ -503,7 +506,7 @@ class FunctionReturn(object):
         return hash((self.callee_func_addr, self.caller_func_addr, self.call_site_addr, self.return_to))
 
 
-class PendingJobs(object):
+class PendingJobs:
     """
     A collection of pending jobs during CFG recovery.
     """
@@ -551,7 +554,7 @@ class PendingJobs(object):
             return None
 
         if not returning:
-            return self._pop_job(self._jobs.keys()[0])
+            return self._pop_job(next(iter(self._jobs.keys())))
 
         # Prioritize returning functions
         for func_addr in self._jobs:
@@ -617,7 +620,7 @@ class PendingJobs(object):
 #
 
 
-class FunctionEdge(object):
+class FunctionEdge:
     __slots__ = ('src_func_addr', 'stmt_idx', 'ins_addr',)
 
     def apply(self, cfg):
@@ -639,11 +642,17 @@ class FunctionTransitionEdge(FunctionEdge):
         self.ins_addr = ins_addr
 
     def apply(self, cfg):
+        to_outside = self.to_outside
+        if not to_outside:
+            # is it jumping to outside? Maybe we are seeing more functions now.
+            dst_node = cfg.get_any_node(self.dst_addr, force_fastpath=True)
+            if dst_node is not None and dst_node.function_address != self.src_func_addr:
+                to_outside = True
         return cfg._function_add_transition_edge(
             self.dst_addr,
             self.src_node,
             self.src_func_addr,
-            to_outside=self.to_outside,
+            to_outside=to_outside,
             dst_func_addr=self.dst_func_addr,
             stmt_idx=self.stmt_idx,
             ins_addr=self.ins_addr,
@@ -715,7 +724,7 @@ class FunctionReturnEdge(FunctionEdge):
 #
 
 
-class CFGJob(object):
+class CFGJob:
     """
     Defines a job to work on during the CFG recovery
     """
@@ -790,9 +799,9 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
     # Active scanning
 
         - If the binary has "function symbols" (TODO: this term is not accurate enough), they are starting points of
-            the code scanning
+          the code scanning
         - If the binary does not have any "function symbol", we will first perform a function prologue scanning on the
-            entire binary, and start from those places that look like function beginnings
+          entire binary, and start from those places that look like function beginnings
         - Otherwise, the binary's entry point will be the starting point for scanning
 
     # Passive scanning
@@ -806,15 +815,22 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
     and then re-recover the CFG.
     """
 
-    # TODO: Move arch_options to CFGBase, and add those logic to CFGAccurate as well.
+    # TODO: Move arch_options to CFGBase, and add those logic to CFGEmulated as well.
     # TODO: Identify tail call optimization, and correctly mark the target as a new function
 
-    PRINTABLES = string.printable.replace("\x0b", "").replace("\x0c", "")
+    PRINTABLES = string.printable.replace("\x0b", "").replace("\x0c", "").encode()
+    SPECIAL_THUNKS = {
+        'AMD64': {
+            bytes.fromhex('E807000000F3900FAEE8EBF9488D642408C3'): ('ret',),
+            bytes.fromhex('E807000000F3900FAEE8EBF948890424C3'): ('jmp', 'rax'),
+        }
+    }
 
     tag = "CFGFast"
 
     def __init__(self,
                  binary=None,
+                 objects=None,
                  regions=None,
                  pickle_intermediate_results=False,
                  symbols=True,
@@ -836,12 +852,17 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
                  exclude_sparse_regions=True,
                  skip_specific_regions=True,
                  heuristic_plt_resolving=None,
+                 detect_tail_calls=False,
+                 low_priority=False,
+                 cfb=None,
                  start=None,  # deprecated
                  end=None,  # deprecated
                  **extra_arch_options
                  ):
         """
         :param binary:                  The binary to recover CFG on. By default the main binary is used.
+        :param objects:                 A list of objects to recover the CFG on. By default it will recover the CFG of
+                                        all loaded objects.
         :param iterable regions:        A list of tuples in the form of (start address, end address) describing memory
                                         regions that the CFG should cover.
         :param bool pickle_intermediate_results: If we want to store the intermediate results or not.
@@ -871,6 +892,7 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
                                              default indirect jump resolvers specific to this architecture and binary
                                              types will be loaded.
         :param base_state:              A state to use as a backer for all memory loads
+        :param bool detect_tail_calls:  Enable aggressive tail-call optimization detection.
         :param int start:               (Deprecated) The beginning address of CFG recovery.
         :param int end:                 (Deprecated) The end address of CFG recovery.
         :param CFGArchOptions arch_options: Architecture-specific options.
@@ -898,11 +920,14 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
             resolve_indirect_jumps=resolve_indirect_jumps,
             indirect_jump_resolvers=indirect_jump_resolvers,
             indirect_jump_target_limit=indirect_jump_target_limit,
+            detect_tail_calls=detect_tail_calls,
+            low_priority=low_priority,
         )
 
         # necessary warnings
+        regions_not_specified = regions is None and binary is None and not objects
         if self.project.loader._auto_load_libs is True and end is None and len(self.project.loader.all_objects) > 3 \
-                and regions is None:
+                and regions_not_specified:
             l.warning('"auto_load_libs" is enabled. With libraries loaded in project, CFGFast will cover libraries, '
                       'which may take significantly more time than expected. You may reload the binary with '
                       '"auto_load_libs" disabled, or specify "regions" to limit the scope of CFG recovery.'
@@ -917,9 +942,12 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
             else:
                 l.warning('"regions", "start", and "end" are all specified. Ignoring "start" and "end".')
 
-        regions = regions if regions is not None else self._executable_memory_regions(binary=None,
+        if binary is not None and not objects:
+            objects = [ binary ]
+        regions = regions if regions is not None else self._executable_memory_regions(objects=objects,
                                                                                       force_segment=force_segment
                                                                                       )
+
         if exclude_sparse_regions:
             new_regions = [ ]
             for start_, end_ in regions:
@@ -963,14 +991,12 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
 
         self._extra_cross_references = extra_cross_references
 
-        try:
-            self._arch_options = arch_options if arch_options is not None else CFGArchOptions(self.project.arch,
-                                                                                              **extra_arch_options
-                                                                                              )
-        except KeyError:
-            raise
+        self._arch_options = arch_options if arch_options is not None else CFGArchOptions(
+                self.project.arch, **extra_arch_options)
 
         self._data_type_guessing_handlers = [ ] if data_type_guessing_handlers is None else data_type_guessing_handlers
+
+        self._cfb = cfb
 
         l.debug("CFG recovery covers %d regions:", len(self._regions))
         for start_addr in self._regions:
@@ -980,6 +1006,9 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
         self._memory_data = { }
         # A mapping between address of the instruction that's referencing the memory data and the memory data itself
         self.insn_addr_to_memory_data = { }
+
+        # mapping to all known thunks
+        self._known_thunks = {}
 
         self._initial_state = None
         self._next_addr = None
@@ -1010,6 +1039,14 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
         # Start working!
         self._analyze()
 
+    def __getstate__(self):
+        d = dict(self.__dict__)
+        d['_progress_callback'] = None
+        return d
+
+    def __setstate__(self, d):
+        self.__dict__.update(d)
+
     #
     # Utils
     #
@@ -1030,9 +1067,9 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
         if size is None:
             size = len(data)
 
-        data = str(pyvex.ffi.buffer(data, size))
-        for x in xrange(0, 256):
-            p_x = float(data.count(chr(x))) / size
+        data = bytes(pyvex.ffi.buffer(data, size))
+        for x in range(0, 256):
+            p_x = float(data.count(x)) / size
             if p_x > 0:
                 entropy += - p_x * math.log(p_x, 2)
         return entropy
@@ -1049,25 +1086,6 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
     def _insn_addr_to_memory_data(self):
         l.warning('_insn_addr_to_memory_data has been made public and is deprecated. Please fix your code accordingly.')
         return self.insn_addr_to_memory_data
-
-    #
-    # Private methods
-    #
-
-    def __setstate__(self, s):
-        self._graph = s['graph']
-        self.indirect_jumps = s['indirect_jumps']
-        self._nodes_by_addr = s['_nodes_by_addr']
-        self._memory_data = s['_memory_data']
-
-    def __getstate__(self):
-        s = {
-            "graph": self.graph,
-            "indirect_jumps": self.indirect_jumps,
-            '_nodes_by_addr': self._nodes_by_addr,
-            '_memory_data': self._memory_data,
-        }
-        return s
 
     # Methods for determining scanning scope
 
@@ -1114,7 +1132,7 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
             return address
 
         try:
-            return next(self._regions.irange(minimum=address, reverse=True))
+            return next(self._regions.irange(minimum=address, reverse=False))
         except StopIteration:
             return None
 
@@ -1177,7 +1195,7 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
     def _load_a_byte_as_int(self, addr):
         if self._base_state is not None:
             try:
-                val = chr(self._base_state.mem_concrete(addr, 1, inspect=False, disable_actions=True))
+                val = self._base_state.mem_concrete(addr, 1, inspect=False, disable_actions=True)
             except SimValueError:
                 # Not concretizable
                 l.debug("Address %#x is not concretizable!", addr)
@@ -1190,7 +1208,7 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
 
     def _scan_for_printable_strings(self, start_addr):
         addr = start_addr
-        sz = ""
+        sz = []
         is_sz = True
 
         # Get data until we meet a null-byte
@@ -1199,18 +1217,18 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
             val = self._load_a_byte_as_int(addr)
             if val is None:
                 break
-            if val == '\x00':
+            if val == 0:
                 if len(sz) < 4:
                     is_sz = False
                 break
             if val not in self.PRINTABLES:
                 is_sz = False
                 break
-            sz += val
+            sz.append(val)
             addr += 1
 
         if sz and is_sz:
-            l.debug("Got a string of %d chars: [%s]", len(sz), sz)
+            l.debug("Got a string of %d chars: [%s]", len(sz), bytes(sz).decode())
             string_length = len(sz) + 1
             return string_length
 
@@ -1233,7 +1251,7 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
                 break
             addr += 1
 
-        if repeating_length > self.project.arch.bits / 8:  # this is pretty random
+        if repeating_length > self.project.arch.bytes:  # this is pretty random
             return repeating_length
         else:
             return 0
@@ -1304,6 +1322,9 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
         # Call _initialize_cfg() before self.functions is used.
         self._initialize_cfg()
 
+        # Scan for __x86_return_thunk and friends
+        self._known_thunks = self._find_thunks()
+
         # Initialize variables used during analysis
         self._pending_jobs = PendingJobs(self.functions, self._deregister_analysis_job)
         self._traced_addresses = set()
@@ -1319,7 +1340,7 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
         # Create an initial state. Store it to self so we can use it globally.
         self._initial_state = self.project.factory.blank_state(mode="fastpath")
         initial_options = self._initial_state.options - {o.TRACK_CONSTRAINTS} - o.refs
-        initial_options |= {o.SUPER_FASTPATH}
+        initial_options |= {o.SUPER_FASTPATH, o.SYMBOL_FILL_UNCONSTRAINED_REGISTERS, o.SYMBOL_FILL_UNCONSTRAINED_MEMORY}
         # initial_options.remove(o.COW_STATES)
         self._initial_state.options = initial_options
 
@@ -1354,7 +1375,7 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
         self._nodes = {}
         self._nodes_by_addr = defaultdict(list)
 
-        if self._use_function_prologues:
+        if self._use_function_prologues and self.project.concrete_target is None:
             self._function_prologue_addrs = sorted(self._func_addrs_from_prologues())
             # make a copy of those prologue addresses, so that we can pop from the list
             self._remaining_function_prologue_addrs = self._function_prologue_addrs[::]
@@ -1370,8 +1391,19 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
         :return: None
         """
 
+        if self._low_priority:
+            self._release_gil(len(self._nodes), 20, 0.0001)
+
         # a new entry is picked. Deregister it
         self._deregister_analysis_job(job.func_addr, job)
+
+        if not self._inside_regions(job.addr):
+            obj = self.project.loader.find_object_containing(job.addr)
+            if obj is not None and isinstance(obj, self._cle_pseudo_objects):
+                pass
+            else:
+                # it's outside permitted regions. skip.
+                raise AngrSkipJobNotice()
 
         # Do not calculate progress if the user doesn't care about the progress at all
         if self._show_progressbar or self._progress_callback:
@@ -1380,7 +1412,7 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
             if percentage > max_percentage_stage_1:
                 percentage = max_percentage_stage_1
 
-            self._update_progress(percentage)
+            self._update_progress(percentage, cfg=self)
 
     def _intra_analysis(self):
         pass
@@ -1414,11 +1446,12 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
     def _widen_jobs(self, *jobs):
         pass
 
-    def _post_process_successors(self, addr, successors):
+    def _post_process_successors(self, addr, size, successors):
 
         if self.project.arch.name in ('ARMEL', 'ARMHF') and addr % 2 == 1:
             # we are in thumb mode. filter successors
             successors = self._arm_thumb_filter_jump_successors(addr,
+                                                                size,
                                                                 successors,
                                                                 lambda tpl: tpl[1],
                                                                 lambda tpl: tpl[0]
@@ -1465,6 +1498,13 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
                 self._insert_job(job)
                 return
 
+        # Try to see if there is any indirect jump left to be resolved
+        if self._resolve_indirect_jumps and self._indirect_jumps_to_resolve:
+            self._process_unresolved_indirect_jumps()
+
+            if self._job_info_queue:
+                return
+
         if self._use_function_prologues and self._remaining_function_prologue_addrs:
             while self._remaining_function_prologue_addrs:
                 prolog_addr = self._remaining_function_prologue_addrs[0]
@@ -1477,15 +1517,12 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
                 self._register_analysis_job(prolog_addr, job)
                 return
 
-        # Try to see if there is any indirect jump left to be resolved
-        if self._resolve_indirect_jumps and self._indirect_jumps_to_resolve:
-            self._process_unresolved_indirect_jumps()
-
-            if self._job_info_queue:
-                return
-
         if self._force_complete_scan:
             addr = self._next_code_addr()
+            if addr is None:
+                l.debug("Force-scan jumping failed")
+            else:
+                l.debug("Force-scanning to %#x", addr)
 
             if addr is not None:
                 job = CFGJob(addr, addr, "Ijk_Boring", last_addr=None, job_type=CFGJob.JOB_TYPE_COMPLETE_SCANNING)
@@ -1495,6 +1532,17 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
     def _post_analysis(self):
 
         self._make_completed_functions()
+
+        if self._normalize:
+            # Normalize the control flow graph first before rediscovering all functions
+            self.normalize()
+
+        if self.project.arch.name in ('X86', 'AMD64', 'MIPS32'):
+            self._remove_redundant_overlapping_blocks()
+
+        self._updated_nonreturning_functions = set()
+        # Revisit all edges and rebuild all functions to correctly handle returning/non-returning functions.
+        self.make_functions()
 
         self._analyze_all_function_features()
 
@@ -1518,7 +1566,7 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
                         target_funcs = [ self.functions.function(addr=func_addr)
                                          for func_addr in callsites_to_functions[src.addr]
                                          ]
-                        if target_funcs and all([ t is not None and t.returning is False for t in target_funcs ]):
+                        if target_funcs and all(t is not None and t.returning is False for t in target_funcs):
                             # Remove this edge
                             edges_to_remove.append((src, dst))
                         else:
@@ -1536,14 +1584,10 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
             if f.returning is None:
                 f.returning = len(f.endpoints) > 0  # pylint:disable=len-as-condition
 
-        if self.project.arch.name in ('X86', 'AMD64', 'MIPS32'):
-            self._remove_redundant_overlapping_blocks()
+        # Finally, mark endpoints of every single function
+        for function in self.kb.functions.values():
+            function.mark_nonreturning_calls_endpoints()
 
-        if self._normalize:
-            # Normalize the control flow graph first before rediscovering all functions
-            self.normalize()
-
-        self.make_functions()
         # optional: remove functions that must be alignments
         self.remove_function_alignments()
 
@@ -1582,15 +1626,7 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
         :rtype: set
         """
 
-        symbols_by_addr = self._binary.symbols_by_addr
-
-        func_addrs = set()
-
-        for addr, sym in symbols_by_addr.iteritems():
-            if sym.is_function:
-                func_addrs.add(addr)
-
-        return func_addrs
+        return {sym.rebased_addr for sym in self._binary.symbols if sym.is_function}
 
     def _func_addrs_from_prologues(self):
         """
@@ -1606,14 +1642,9 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
             regexes.append(r)
 
         # Construct the binary blob first
-        # TODO: We shouldn't directly access the _memory of main_object. An interface
-        # TODO: to that would be awesome.
+        unassured_functions = [ ]
 
-        strides = self._binary.memory.stride_repr
-
-        unassured_functions = []
-
-        for start_, _, bytes_ in strides:
+        for start_, bytes_ in self._binary.memory.backers():
             for regex in regexes:
                 # Match them!
                 for mo in regex.finditer(bytes_):
@@ -1622,7 +1653,7 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
                         mapped_position = AT.from_rva(position, self._binary).to_mva()
                         if self._addr_in_exec_memory_regions(mapped_position):
                             unassured_functions.append(mapped_position)
-
+        l.info("Found %d functions with prologue scanning.", len(unassured_functions))
         return unassured_functions
 
     # Basic block scanning
@@ -1728,7 +1759,7 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
             for addr_, jumpkind in new_exits:
                 if isinstance(addr_, claripy.ast.BV) and not addr_.symbolic:
                     addr_ = addr_._model_concrete.value
-                if not isinstance(addr_, (int, long)):
+                if not isinstance(addr_, int):
                     continue
                 entries += self._create_jobs(addr_, jumpkind, current_func_addr, None, addr_, cfg_node, None,
                                              None
@@ -1773,8 +1804,8 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
                              )
         self._function_add_node(cfg_node, function_addr)
 
-        if self.functions.get_by_addr(current_func_addr).returning is not True:
-            self._updated_nonreturning_functions.add(current_func_addr)
+        if self.functions.get_by_addr(function_addr).returning is not True:
+            self._updated_nonreturning_functions.add(function_addr)
 
         # If we have traced it before, don't trace it anymore
         real_addr = self._real_address(self.project.arch, addr)
@@ -1830,7 +1861,7 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
 
         entries = [ ]
 
-        successors = self._post_process_successors(addr, successors)
+        successors = self._post_process_successors(addr, irsb.size, successors)
 
         # Process each successor
         for suc in successors:
@@ -1863,10 +1894,20 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
             target_addr = target.con.value
         elif type(target) in (pyvex.IRConst.U32, pyvex.IRConst.U64):  # pylint: disable=unidiomatic-typecheck
             target_addr = target.value
-        elif type(target) in (int, long):  # pylint: disable=unidiomatic-typecheck
+        elif type(target) is int:  # pylint: disable=unidiomatic-typecheck
             target_addr = target
         else:
             target_addr = None
+
+        if target_addr in self._known_thunks and jumpkind == 'Ijk_Boring':
+            thunk_kind = self._known_thunks[target_addr][0]
+            if thunk_kind == 'ret':
+                jumpkind = 'Ijk_Ret'
+                target_addr = None
+            elif thunk_kind == 'jmp':
+                pass # ummmmmm not sure about this one
+            else:
+                raise AngrCFGError("This shouldn't be possible")
 
         jobs = [ ]
         is_syscall = jumpkind.startswith("Ijk_Sys")
@@ -1894,9 +1935,12 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
                 cfg_node.has_return = True
 
             elif self._resolve_indirect_jumps and \
-                    (jumpkind in ('Ijk_Boring', 'Ijk_Call') or jumpkind.startswith('Ijk_Sys')):
+                    (jumpkind in ('Ijk_Boring', 'Ijk_Call', 'Ijk_InvalICache') or jumpkind.startswith('Ijk_Sys')):
                 # This is an indirect jump. Try to resolve it.
-
+                # FIXME: in some cases, a statementless irsb will be missing its instr addresses
+                # and this next part will fail. Use the real IRSB instead
+                irsb = cfg_node.block.vex
+                cfg_node.instruction_addrs = irsb.instruction_addresses
                 resolved, resolved_targets, ij = self._indirect_jump_encountered(addr, cfg_node, irsb,
                                                                                  current_function_addr, stmt_idx)
                 if resolved:
@@ -1915,7 +1959,7 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
                             jobs.append(ce)
                     return jobs
 
-                if jumpkind == "Ijk_Boring":
+                if jumpkind in ("Ijk_Boring", 'Ijk_InvalICache'):
                     resolved_as_plt = False
 
                     if irsb and self._heuristic_plt_resolving:
@@ -1961,7 +2005,7 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
             # This is a direct jump with a concrete target.
 
             # pylint: disable=too-many-nested-blocks
-            if jumpkind == 'Ijk_Boring':
+            if jumpkind in ('Ijk_Boring', 'Ijk_InvalICache'):
                 # if the target address is at another section, it has to be jumping to a new function
                 if not self._addrs_belong_to_same_section(addr, target_addr):
                     target_func_addr = target_addr
@@ -1998,6 +2042,7 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
             else:
                 # TODO: Support more jumpkinds
                 l.debug("Unsupported jumpkind %s", jumpkind)
+                l.debug("Instruction address: %#x", ins_addr)
 
         return jobs
 
@@ -2027,10 +2072,10 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
             tmp_state = self.project.factory.blank_state(mode="fastpath", addr=cfg_node.addr)
             # Find the first successor with a syscall jumpkind
             succ = next(iter(succ for succ in self.project.factory.successors(tmp_state).flat_successors
-                             if succ.jumpkind and succ.jumpkind.startswith("Ijk_Sys")), None)
+                             if succ.history.jumpkind and succ.history.jumpkind.startswith("Ijk_Sys")), None)
             if succ is None:
                 # For some reason, there is no such successor with a syscall jumpkind
-                target_addr = self._unresolvable_target_addr
+                target_addr = self._unresolvable_call_target_addr
             else:
                 try:
                     syscall_stub = self.project.simos.syscall(succ)
@@ -2038,9 +2083,9 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
                         syscall_addr = syscall_stub.addr
                         target_addr = syscall_addr
                     else:
-                        target_addr = self._unresolvable_target_addr
+                        target_addr = self._unresolvable_call_target_addr
                 except AngrUnsupportedSyscallError:
-                    target_addr = self._unresolvable_target_addr
+                    target_addr = self._unresolvable_call_target_addr
 
         new_function_addr = target_addr
         if irsb is None:
@@ -2063,6 +2108,7 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
 
         callee_might_return = True
         callee_function = None
+
         if new_function_addr is not None:
             callee_function = self.kb.functions.function(addr=new_function_addr, syscall=is_syscall)
             if callee_function is not None:
@@ -2077,21 +2123,32 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
                     ret_edge = FunctionReturnEdge(new_function_addr, return_site, current_function_addr)
                     func_edges.append(ret_edge)
 
+                    # Also, keep tracing from the return site
+                    ce = CFGJob(return_site, current_function_addr, 'Ijk_FakeRet', last_addr=addr, src_node=cfg_node,
+                                src_stmt_idx=stmt_idx, src_ins_addr=ins_addr, returning_source=new_function_addr,
+                                syscall=is_syscall, func_edges=func_edges)
+                    self._pending_jobs.add_job(ce)
+                    # register this job to this function
+                    self._register_analysis_job(current_function_addr, ce)
+                elif callee_function is not None and callee_function.returning is False:
+                    pass # Don't go past a call that does not return!
                 else:
+                    # HACK: We don't know where we are jumping.  Let's assume we fakeret to the
+                    # next instruction after the block
+                    # TODO: FIXME: There are arch-specific hints to give the correct ret site
+                    # Such as looking for constant values of LR in this block for ARM stuff.
                     fakeret_edge = FunctionFakeRetEdge(cfg_node, return_site, current_function_addr, confirmed=None)
                     func_edges.append(fakeret_edge)
                     fr = FunctionReturn(new_function_addr, current_function_addr, addr, return_site)
                     if fr not in self._function_returns[new_function_addr]:
                         self._function_returns[new_function_addr].add(fr)
+                    ce = CFGJob(return_site, current_function_addr, 'Ijk_FakeRet', last_addr=addr, src_node=cfg_node,
+                                src_stmt_idx=stmt_idx, src_ins_addr=ins_addr, returning_source=new_function_addr,
+                                syscall=is_syscall, func_edges=func_edges)
+                    self._pending_jobs.add_job(ce)
+                    # register this job to this function
+                    self._register_analysis_job(current_function_addr, ce)
 
-            if return_site is not None:
-                # Also, keep tracing from the return site
-                ce = CFGJob(return_site, current_function_addr, 'Ijk_FakeRet', last_addr=addr, src_node=cfg_node,
-                            src_stmt_idx=stmt_idx, src_ins_addr=ins_addr, returning_source=new_function_addr,
-                            syscall=is_syscall, func_edges=func_edges)
-                self._pending_jobs.add_job(ce)
-                # register this job to this function
-                self._register_analysis_job(current_function_addr, ce)
 
         return jobs
 
@@ -2168,7 +2225,7 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
             """
             if type(data_) is pyvex.expr.Const:  # pylint: disable=unidiomatic-typecheck
                 val = data_.con.value
-            elif type(data_) in (int, long):
+            elif type(data_) is int:
                 val = data_
             else:
                 return
@@ -2190,15 +2247,19 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
         next_instr_addr = None
         for stmt_idx, stmt in enumerate(irsb.statements):
             if type(stmt) is pyvex.IRStmt.IMark:  # pylint: disable=unidiomatic-typecheck
-                instr_addr = instr_addrs[0]
-                instr_addrs = instr_addrs[1 : ]
-                next_instr_addr = instr_addrs[0] if instr_addrs else None
+                instr_addr = stmt.addr + stmt.delta
+                # there can be weird cases sometimes... I've seen two IMarks with the exact same address showing up one
+                # after the other.
+                if instr_addrs and instr_addr == instr_addrs[0]:
+                    instr_addr = instr_addrs[0]
+                    instr_addrs = instr_addrs[1 : ]
+                    next_instr_addr = instr_addrs[0] if instr_addrs else None
 
             elif type(stmt) is pyvex.IRStmt.WrTmp:  # pylint: disable=unidiomatic-typecheck
                 if type(stmt.data) is pyvex.IRExpr.Load:  # pylint: disable=unidiomatic-typecheck
                     # load
                     # e.g. t7 = LDle:I64(0x0000000000600ff8)
-                    size = stmt.data.result_size(irsb.tyenv) / 8 # convert to bytes
+                    size = stmt.data.result_size(irsb.tyenv) // 8 # convert to bytes
                     _process(irsb, stmt, stmt_idx, stmt.data.addr, instr_addr, next_instr_addr,
                              data_size=size, data_type='integer'
                              )
@@ -2303,7 +2364,7 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
         """
 
         # Make sure all memory data entries cover all data sections
-        keys = sorted(self._memory_data.iterkeys())
+        keys = sorted(self._memory_data.keys())
         for i, data_addr in enumerate(keys):
             data = self._memory_data[data_addr]
             if self._addr_in_exec_memory_regions(data.address):
@@ -2352,7 +2413,10 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
                 if boundary is not None:
                     data.max_size = boundary - data_addr
 
-        keys = sorted(self._memory_data.iterkeys())
+                if data.max_size is None:
+                    print('wtf')
+
+        keys = sorted(self._memory_data.keys())
 
         new_data_found = False
 
@@ -2371,7 +2435,7 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
 
             # let's see what sort of data it is
             if memory_data.sort in ('unknown', None) or \
-                    (memory_data.sort == 'integer' and memory_data.size == self.project.arch.bits / 8):
+                    (memory_data.sort == 'integer' and memory_data.size == self.project.arch.bytes):
                 data_type, data_size = self._guess_data_type(memory_data.irsb, memory_data.irsb_addr,
                                                              memory_data.stmt_idx, data_addr, memory_data.max_size,
                                                              content_holder=content_holder
@@ -2386,7 +2450,7 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
                 if len(content_holder) == 1:
                     memory_data.content = content_holder[0]
 
-                if memory_data.size > 0 and memory_data.size < memory_data.max_size:
+                if memory_data.max_size is not None and (0 < memory_data.size < memory_data.max_size):
                     # Create another memory_data object to fill the gap
                     new_addr = data_addr + memory_data.size
                     new_md = MemoryData(new_addr, None, None, None, None, None, None,
@@ -2396,9 +2460,9 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
 
                 if data_type == 'pointer-array':
                     # make sure all pointers are identified
-                    pointer_size = self.project.arch.bits / 8
+                    pointer_size = self.project.arch.bytes
 
-                    for j in xrange(0, data_size, pointer_size):
+                    for j in range(0, data_size, pointer_size):
                         ptr = self._fast_memory_load_pointer(data_addr + j)
 
                         # is this pointer coming from the current binary?
@@ -2451,7 +2515,7 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
             # TODO: Further check if it's the beginning of an instruction
             return "code reference", 0
 
-        pointer_size = self.project.arch.bits / 8
+        pointer_size = self.project.arch.bytes
 
         # who's using it?
         if isinstance(self.project.loader.main_object, cle.MetaELF):
@@ -2460,10 +2524,17 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
                 # IRSB is owned by plt!
                 return "GOT PLT Entry", pointer_size
 
+        # is it in a section with zero bytes, like .bss?
+        obj = self.project.loader.find_object_containing(data_addr)
+        section = obj.find_section_containing(data_addr)
+        if section is not None and section.only_contains_uninitialized_data:
+            # Nothing much you can do
+            return None, None
+
         pointers_count = 0
 
         max_pointer_array_size = min(512 * pointer_size, max_size)
-        for i in xrange(0, max_pointer_array_size, pointer_size):
+        for i in range(0, max_pointer_array_size, pointer_size):
             ptr = self._fast_memory_load_pointer(data_addr + i)
 
             if ptr is not None:
@@ -2485,34 +2556,49 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
         if pointers_count:
             return "pointer-array", pointer_size * pointers_count
 
-        block, block_size = self._fast_memory_load(data_addr)
+        try:
+            data = self.project.loader.memory.load(data_addr, 1024)
+        except KeyError:
+            data = b''
 
         # Is it an unicode string?
         # TODO: Support unicode string longer than the max length
-        if block_size >= 4 and block[1] == 0 and block[3] == 0 and chr(block[0]) in self.PRINTABLES:
-            max_unicode_string_len = 1024
+        if len(data) >= 4 and data[1] == 0 and data[3] == 0 and data[0] in self.PRINTABLES:
+            def can_decode(n):
+                try:
+                    data[:n*2].decode('utf_16_le')
+                except UnicodeDecodeError:
+                    return False
+                return True
+            if can_decode(4) or can_decode(5) or can_decode(6):
+                running_failures = 0
+                last_success = 4
+                for i in range(4, len(data) // 2):
+                    if can_decode(i):
+                        last_success = i
+                        running_failures = 0
+                        if data[i*2-2] == 0 and data[i*2-1] == 0:
+                            break
+                    else:
+                        running_failures += 1
+                        if running_failures > 3:
+                            break
+
+                return "unicode", last_success
+
+        if data:
             try:
-                unicode_str = self._ffi.string(self._ffi.cast("wchar_t*", block), max_unicode_string_len)
+                zero_pos = data.index(0)
             except ValueError:
-                # cffi fails to interpret the bytes as unicode
-                unicode_str = u''
-
-            if (len(unicode_str) and  # pylint:disable=len-as-condition
-                    all([ c in self.PRINTABLES for c in unicode_str])):
-                if content_holder is not None:
-                    content_holder.append(unicode_str)
-                return "unicode", (len(unicode_str) + 1) * 2
-
-        # Is it a null-terminated printable string?
-        max_string_len = min([ block_size, max_size, 4096 ])
-        s = self._ffi.string(self._ffi.cast("char*", block), max_string_len)
-        if len(s):  # pylint:disable=len-as-condition
-            if all([ c in self.PRINTABLES for c in s ]):
+                zero_pos = None
+            if (zero_pos is not None and zero_pos > 0 and all(c in self.PRINTABLES for c in data[:zero_pos])) or \
+                    all(c in self.PRINTABLES for c in data):
                 # it's a string
                 # however, it may not be terminated
+                string_data = data if zero_pos is None else data[:zero_pos]
                 if content_holder is not None:
-                    content_holder.append(s)
-                return "string", min(len(s) + 1, max_string_len)
+                    content_holder.append(string_data)
+                return "string", min(len(string_data) + 1, 1024)
 
         for handler in self._data_type_guessing_handlers:
             sort, size = handler(self, irsb, irsb_addr, stmt_idx, data_addr, max_size)
@@ -2615,23 +2701,34 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
         :return:    None
         """
 
-        # add a node from this node to the UnresolvableTarget node
+        # add a node from this node to UnresolvableJumpTarget or UnresolvalbeCallTarget node,
+        # depending on its jump kind
         src_node = self._nodes[jump.addr]
-        dst_node = CFGNode(self._unresolvable_target_addr, 0, self,
-                           function_address=self._unresolvable_target_addr,
-                           simprocedure_name='UnresolvableTarget',
+        if jump.jumpkind == 'Ijk_Boring':
+            unresolvable_target_addr = self._unresolvable_jump_target_addr
+            simprocedure_name = 'UnresolvableJumpTarget'
+        elif jump.jumpkind == 'Ijk_Call':
+            unresolvable_target_addr = self._unresolvable_call_target_addr
+            simprocedure_name = 'UnresolvableCallTarget'
+        else:
+            raise AngrCFGError('It should be impossible')
+
+        dst_node = CFGNode(unresolvable_target_addr, 0, self,
+                           function_address=unresolvable_target_addr,
+                           simprocedure_name=simprocedure_name,
+                           block_id=unresolvable_target_addr,
                            )
 
         # add the dst_node to self._nodes
-        if self._unresolvable_target_addr not in self._nodes:
-            self._nodes[self._unresolvable_target_addr] = dst_node
-            self._nodes_by_addr[self._unresolvable_target_addr].append(dst_node)
+        if unresolvable_target_addr not in self._nodes:
+            self._nodes[unresolvable_target_addr] = dst_node
+            self._nodes_by_addr[unresolvable_target_addr].append(dst_node)
 
         self._graph_add_edge(dst_node, src_node, jump.jumpkind, jump.ins_addr, jump.stmt_idx)
         # mark it as a jumpout site for that function
-        self._function_add_transition_edge(self._unresolvable_target_addr, src_node, jump.func_addr,
+        self._function_add_transition_edge(unresolvable_target_addr, src_node, jump.func_addr,
                                            to_outside=True,
-                                           dst_func_addr=self._unresolvable_target_addr,
+                                           dst_func_addr=unresolvable_target_addr,
                                            ins_addr=jump.ins_addr,
                                            stmt_idx=jump.stmt_idx,
                                            )
@@ -2673,13 +2770,12 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
                     # this function might be created from linear sweeping
                     try:
                         block = self._lift(a.addr, size=0x10 - (a.addr % 0x10), opt_level=1)
-                        vex_block = block.vex
                     except SimTranslationError:
                         continue
 
                     nop_length = None
 
-                    if self._is_noop_block(vex_block):
+                    if self._is_noop_block(self.project.arch, block):
                         # fast path: in most cases, the entire block is a single byte or multi-byte nop, which VEX
                         # optimizer is able to tell
                         nop_length = block.size
@@ -2707,6 +2803,7 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
                                                                     ),
                                             thumb=a.thumb,
                                             byte_string=None if a.byte_string is None else a.byte_string[nop_length:],
+                                            block_id=next_node_addr,
                                             )
                         self.graph.add_node(next_node)
 
@@ -2727,13 +2824,13 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
 
         # append all new nodes to sorted nodes
         if nodes_to_append:
-            sorted_nodes = sorted(sorted_nodes + nodes_to_append.values(), key=lambda n: n.addr if n is not None else 0)
+            sorted_nodes = sorted(sorted_nodes + list(nodes_to_append.values()), key=lambda n: n.addr if n is not None else 0)
 
         removed_nodes = set()
 
         a = None  # it always hold the very recent non-removed node
 
-        for i in xrange(len(sorted_nodes)):
+        for i in range(len(sorted_nodes)):  # pylint:disable=consider-using-enumerate
 
             if a is None:
                 a = sorted_nodes[0]
@@ -2867,7 +2964,8 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
                                                      if node.addr <= i < node.addr + new_size
                                                    ),
                            thumb=node.thumb,
-                           byte_string=None if node.byte_string is None else node.byte_string[:new_size]
+                           byte_string=None if node.byte_string is None else node.byte_string[:new_size],
+                           block_id=node.addr,
                            )
 
         old_in_edges = self.graph.in_edges(node, data=True)
@@ -2892,13 +2990,15 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
         # from node A to node B.
         # this matters in cases where node B is resolved as a special indirect jump entry (like a PLT stub), but (node
         # A + node B) wasn't properly resolved.
-        has_resolved_targets = any([ node_.addr != self._unresolvable_target_addr
+        unresolvable_target_addrs = (self._unresolvable_jump_target_addr, self._unresolvable_call_target_addr)
+
+        has_resolved_targets = any([ node_.addr not in unresolvable_target_addrs
                                      for node_ in self.graph.successors(successor) ]
                                    )
 
         old_out_edges = self.graph.out_edges(node, data=True)
         for _, dst, data in old_out_edges:
-            if (has_resolved_targets and dst.addr != self._unresolvable_target_addr) or \
+            if (has_resolved_targets and dst.addr not in unresolvable_target_addrs) or \
                     not has_resolved_targets:
                 self.graph.add_edge(successor, dst, **data)
 
@@ -2953,6 +3053,13 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
                 if returning_function.addr in self._function_returns:
                     for fr in self._function_returns[returning_function.addr]:
                         # Confirm them all
+                        if not self.kb.functions.contains_addr(fr.caller_func_addr):
+                            # FIXME: A potential bug might arise here. After post processing (phase 2), if the function
+                            # specified by fr.caller_func_addr has been merged to another function during phase 2, we
+                            # will simply skip this FunctionReturn here. It might lead to unconfirmed fake_ret edges
+                            # in the newly merged function. Fix this bug in the future when it becomes an issue.
+                            continue
+
                         if self.kb.functions.get_by_addr(fr.caller_func_addr).returning is not True:
                             self._updated_nonreturning_functions.add(fr.caller_func_addr)
 
@@ -2971,7 +3078,8 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
                 if not_returning_function.addr in self._function_returns:
                     for fr in self._function_returns[not_returning_function.addr]:
                         # Remove all those FakeRet edges
-                        if self.kb.functions.get_by_addr(fr.caller_func_addr).returning is not True:
+                        if self.kb.functions.contains_addr(fr.caller_func_addr) and \
+                                self.kb.functions.get_by_addr(fr.caller_func_addr).returning is not True:
                             self._updated_nonreturning_functions.add(fr.caller_func_addr)
 
                     del self._function_returns[not_returning_function.addr]
@@ -3009,7 +3117,7 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
     @staticmethod
     def _get_return_endpoints(func):
         all_endpoints = func.endpoints_with_type
-        return all_endpoints.get('return', [ ])
+        return all_endpoints.get('return', [])
 
     def _get_jumpout_targets(self, func):
         jumpout_targets = set()
@@ -3058,7 +3166,7 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
         :return: None
         """
 
-        for func_addr, func in self.functions.iteritems():
+        for func_addr, func in self.functions.items():
             if func.returning is False:
                 continue
 
@@ -3293,7 +3401,6 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
         if 'lr_saved_on_stack' in function.info:
             return
 
-        #
         # if it does, we log it down to the Function object.
         lr_offset = self.project.arch.registers['lr'][0]
         sp_offset = self.project.arch.sp_offset
@@ -3390,7 +3497,7 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
             if isinstance(val, tuple) and val[0] == 'load':
                 # the value comes from memory
                 memory_addr = val[1]
-                if isinstance(last_sp, (int, long)):
+                if isinstance(last_sp, int):
                     lr_on_stack_offset = memory_addr - last_sp
                 else:
                     lr_on_stack_offset = memory_addr - last_sp[1]
@@ -3435,7 +3542,7 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
 
                 return addr, current_function_addr, cfg_node, irsb
 
-            is_arm_arch = True if self.project.arch.name in ('ARMHF', 'ARMEL') else False
+            is_arm_arch = self.project.arch.name in ('ARMHF', 'ARMEL')
 
             if is_arm_arch:
                 real_addr = addr & (~1)
@@ -3460,17 +3567,16 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
                     distance = min(distance, VEX_IRSB_MAX_SIZE)
                 # TODO: handle segment information as well
 
-            if cfg_job.job_type == CFGJob.JOB_TYPE_COMPLETE_SCANNING:
-                # also check the distance between `addr` and the closest function.
-                # we don't want to have a basic block that spans across function boundaries
-                next_func = self.functions.ceiling_func(addr)
-                if next_func is not None:
-                    distance_to_func = (next_func.addr & (~1) if is_arm_arch else next_func.addr) - real_addr
-                    if distance_to_func != 0:
-                        if distance is None:
-                            distance = distance_to_func
-                        else:
-                            distance = min(distance, distance_to_func)
+            # also check the distance between `addr` and the closest function.
+            # we don't want to have a basic block that spans across function boundaries
+            next_func = self.functions.ceiling_func(addr)
+            if next_func is not None:
+                distance_to_func = (next_func.addr & (~1) if is_arm_arch else next_func.addr) - real_addr
+                if distance_to_func != 0:
+                    if distance is None:
+                        distance = distance_to_func
+                    else:
+                        distance = min(distance, distance_to_func)
 
             # in the end, check the distance between `addr` and the closest occupied region in segment list
             next_noncode_addr = self._seg_list.next_pos_with_sort_not_in(addr, { "code" }, max_distance=distance)
@@ -3523,12 +3629,14 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
                 # decoding error
                 # we still occupy that location since it cannot be decoded anyways
                 if irsb is None:
-                    irsb_size = 1
+                    irsb_size = 0
                 else:
-                    irsb_size = irsb.size if irsb.size > 0 else 1
-                self._seg_list.occupy(addr, irsb_size, 'nodecode')
-                l.error("Decoding error occurred at basic block address %#x of function %#x.",
-                        addr,
+                    irsb_size = irsb.size
+                nodecode_size = 1
+                self._seg_list.occupy(addr, irsb_size, 'code')
+                self._seg_list.occupy(addr + irsb_size, nodecode_size, 'nodecode')
+                l.error("Decoding error occurred at address %#x of function %#x.",
+                        addr + irsb_size,
                         current_function_addr
                         )
                 return None, None, None, None
@@ -3542,9 +3650,15 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
                 self._seg_list.occupy(real_addr, irsb.size, "code")
 
             # Create a CFG node, and add it to the graph
-            cfg_node = CFGNode(addr, irsb.size, self, function_address=current_function_addr, block_id=addr,
-                               irsb=irsb, thumb=is_thumb, byte_string=irsb_string,
+            cfg_node = CFGNode(addr, irsb.size, self,
+                               function_address=current_function_addr,
+                               block_id=addr,
+                               irsb=irsb,
+                               thumb=is_thumb,
+                               byte_string=irsb_string,
                                )
+            if self._cfb is not None:
+                self._cfb.add_obj(addr, lifted_block)
 
             self._nodes[addr] = cfg_node
             self._nodes_by_addr[addr].append(cfg_node)
@@ -3619,8 +3733,23 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
                     return
 
                 state = succ.flat_successors[0]
-                if not state.regs.gp.symbolic and state.se.is_false(state.regs.gp == 0xffffffff):
+                if not state.regs.gp.symbolic and state.solver.is_false(state.regs.gp == 0xffffffff):
                     function.info['gp'] = state.regs.gp._model_concrete.value
+
+    def _find_thunks(self):
+        if self.project.arch.name not in self.SPECIAL_THUNKS:
+            return {}
+        result = {}
+        for code, meaning in self.SPECIAL_THUNKS[self.project.arch.name].items():
+            for addr in self.project.loader.memory.find(code):
+                if self._addr_in_exec_memory_regions(addr):
+                    result[addr] = meaning
+
+        return result
+
+    def _lift(self, *args, **kwargs):
+        kwargs['extra_stop_points'] = self._known_thunks
+        return super(CFGFast, self)._lift(*args, **kwargs)
 
     #
     # Public methods
@@ -3628,32 +3757,18 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
 
     def copy(self):
         n = CFGFast.__new__(CFGFast)
-        super(CFGFast, self).make_copy(n)
 
-        n._binary = self._binary
-        n._regions = self._regions
-        n._pickle_intermediate_results = self._pickle_intermediate_results
-        n._indirect_jump_target_limit = self._indirect_jump_target_limit
-        n._collect_data_ref = self._collect_data_ref
-        n._use_symbols = self._use_symbols
-        n._use_function_prologues = self._use_function_prologues
-        n._resolve_indirect_jumps = self._resolve_indirect_jumps
-        n._force_segment = self._force_segment
-        n._force_complete_scan = self._force_complete_scan
-
-        n._progress_callback = self._progress_callback
-        n._show_progressbar = self._show_progressbar
+        for attr, value in self.__dict__.items():
+            if attr.startswith('__') and attr.endswith('__'):
+                continue
+            setattr(n, attr, value)
 
         n._exec_mem_regions = self._exec_mem_regions[::]
-        n._exec_mem_region_size = self._exec_mem_region_size
-
         n._memory_data = self._memory_data.copy()
-
         n._seg_list = self._seg_list.copy()
-
         n._function_addresses_from_symbols = self._function_addresses_from_symbols.copy()
 
-        n._graph = self._graph
+        n._graph = self._graph.copy()
 
         return n
 
@@ -3662,6 +3777,7 @@ class CFGFast(ForwardAnalysis, CFGBase):    # pylint: disable=abstract-method
 
         return s
 
+    @deprecated(replacement="angr.analyses.CFB")
     def generate_code_cover(self):
         """
         Generate a list of all recovered basic blocks.

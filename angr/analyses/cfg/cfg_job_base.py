@@ -5,7 +5,7 @@ import logging
 from ...errors import SimValueError, SimSolverModeError
 from ...state_plugins.callstack import CallStack
 
-l = logging.getLogger("angr.analyses.cfg.cfg_job_base")
+l = logging.getLogger(name=__name__)
 
 # TODO: Make callsite an object and use it in BlockID and FunctionKey
 
@@ -29,7 +29,7 @@ class BlockID(object):
 
         s = [ ]
         format_addr = lambda addr: 'None' if addr is None else hex(addr)
-        for i in xrange(0, len(self.callsite_tuples), 2):
+        for i in range(0, len(self.callsite_tuples), 2):
             s.append('@'.join(map(format_addr, self.callsite_tuples[i:i+2])))
         return " -> ".join(s)
 
@@ -84,7 +84,7 @@ class FunctionKey(object):
 
         s = []
         format_addr = lambda addr: 'None' if addr is None else hex(addr)
-        for i in xrange(0, len(self.callsite_tuples), 2):
+        for i in range(0, len(self.callsite_tuples), 2):
             s.append('@'.join(map(format_addr, self.callsite_tuples[i:i + 2])))
         return " -> ".join(s)
 
@@ -130,7 +130,7 @@ class CFGJobBase(object):
             self._call_stack = CallStack()
 
             # Added the function address of the current exit to callstack
-            se = self.state.se
+            se = self.state.solver
             sp_expr = self.state.regs.sp
 
             # If the sp_expr cannot be concretized, the stack pointer cannot be traced anymore.

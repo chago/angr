@@ -1,7 +1,6 @@
 import os
 import sys
 import copy
-import struct
 import ctypes
 import threading
 import itertools
@@ -10,13 +9,14 @@ import logging
 import pyvex
 import claripy
 import time
+import binascii
 
 from ..sim_options import UNICORN_HANDLE_TRANSMIT_SYSCALL
-from ..errors import SimValueError, SimUnicornUnsupport, SimSegfaultError, SimMemoryError, SimUnicornError
+from ..errors import SimValueError, SimUnicornUnsupport, SimSegfaultError, SimMemoryError, SimMemoryMissingError, SimUnicornError
 from .plugin import SimStatePlugin
 from ..misc.testing import is_testing
 
-l = logging.getLogger("angr.state_plugins.unicorn_engine")
+l = logging.getLogger(name=__name__)
 
 try:
     import unicorn
@@ -41,7 +41,7 @@ TRANSMIT_RECORD._fields_ = [
         ('count', ctypes.c_uint32)
     ]
 
-class STOP(object): # stop_t
+class STOP:  # stop_t
     STOP_NORMAL         = 0
     STOP_STOPPOINT      = 1
     STOP_SYMBOLIC_MEM   = 2
@@ -236,9 +236,8 @@ def _load_native():
 
         return h
     except (OSError, AttributeError) as e:
-        e_type, value, traceback = sys.exc_info()
-        l.warning('failed loading "%s", unicorn support disabled (%s: %s)', libfile, e, value)
-        raise ImportError, ("Unable to import native SimUnicorn support.", e_type, value), traceback
+        l.warning('failed loading "%s", unicorn support disabled (%s)', libfile, e)
+        raise ImportError("Unable to import native SimUnicorn support") from e
 
 try:
     _UC_NATIVE = _load_native()
@@ -607,7 +606,7 @@ class Unicorn(SimStatePlugin):
         _UC_NATIVE.stop(self._uc_state, STOP.STOP_SYSCALL)
 
     def _concretize(self, d):
-        cd = self.state.se.eval_to_ast(d, 1)[0]
+        cd = self.state.solver.eval_to_ast(d, 1)[0]
         if hash(d) not in self._concretized_asts:
             constraint = (d == cd).annotate(AggressiveConcretizationAnnotation(self.state.regs.ip))
             self.state.add_constraints(constraint)
@@ -623,7 +622,7 @@ class Unicorn(SimStatePlugin):
             return d
         elif d.variables.issubset(self.always_concretize):
             return self._concretize(d)
-        elif self.state.se.eval(self.state.ip) in self.concretize_at:
+        elif self.state.solver.eval(self.state.ip) in self.concretize_at:
             return self._concretize(d)
         else:
             return d
@@ -631,7 +630,7 @@ class Unicorn(SimStatePlugin):
     def _report_symbolic_blocker(self, d, from_where):
         if options.UNICORN_THRESHOLD_CONCRETIZATION in self.state.options:
             if self.concretization_threshold_instruction is not None:
-                addr = self.state.se.eval(self.state.ip)
+                addr = self.state.solver.eval(self.state.ip)
                 count = self.symbolic_inst_counts.get(addr, 0)
                 l.debug("... inst count for %s: %d", addr, count)
                 self.symbolic_inst_counts[addr] = count + 1
@@ -773,11 +772,8 @@ class Unicorn(SimStatePlugin):
                     perms.add(perm.args[0] | 4)
                 else:
                     perms.add(perm.args[0])
-            except SimMemoryError as e:
-                if e.message == "page does not exist at given address":  # FIXME: direct string comparison is bad
-                    missing_pages.append(addr)
-                else:
-                    raise
+            except SimMemoryMissingError:
+                missing_pages.append(addr)
 
             addr += PAGE_SIZE
 
@@ -825,7 +821,7 @@ class Unicorn(SimStatePlugin):
             if options.CGC_ZERO_FILL_UNCONSTRAINED_MEMORY not in self.state.options:
                 _taint(pos, chunk_size)
             else:
-                data[pos-start:pos-start+chunk_size] = "\0"*chunk_size
+                data[pos-start:pos-start+chunk_size] = b"\0"*chunk_size
 
         # fill out the data in reverse
         last_missing = start + length - 1
@@ -843,7 +839,7 @@ class Unicorn(SimStatePlugin):
                 #print "TAINT: %x, %d" % (mo_addr, chunk_size)
                 _taint(mo_addr, chunk_size)
             else:
-                s = self.state.se.eval(d, cast_to=str)
+                s = self.state.solver.eval(d, cast_to=bytes)
                 data[mo_addr-start:mo_addr-start+chunk_size] = s
             last_missing = mo_addr - 1
 
@@ -857,13 +853,13 @@ class Unicorn(SimStatePlugin):
         if not taint and not perm & 2:
             # page is non-writable, handle it with native code
             l.debug('caching non-writable page')
-            out = _UC_NATIVE.cache_page(self._uc_state, start, length, str(data), perm)
+            out = _UC_NATIVE.cache_page(self._uc_state, start, length, bytes(data), perm)
             return out
         else:
             # if the memory range has already been mapped, or it somehow fails sanity checks, mem_map() may fail with
             # a unicorn.UcError raised. THe exception will be caught outside.
             uc.mem_map(start, length, perm)
-            uc.mem_write(start, str(data))
+            uc.mem_write(start, bytes(data))
             self._mapped += 1
             _UC_NATIVE.activate(self._uc_state, start, length, taint[0] if taint else None)
             return True
@@ -935,7 +931,7 @@ class Unicorn(SimStatePlugin):
             else:
                 _UC_NATIVE.symbolic_register_data(self._uc_state, 0, None)
 
-        addr = self.state.se.eval(self.state.ip)
+        addr = self.state.solver.eval(self.state.ip)
         l.info('started emulation at %#x (%d steps)', addr, self.max_steps if step is None else step)
         self.time = time.time()
         self.errno = _UC_NATIVE.start(self._uc_state, addr, self.max_steps if step is None else step)
@@ -958,7 +954,7 @@ class Unicorn(SimStatePlugin):
         if self.stop_reason == STOP.STOP_NOSTART and self.steps > 0:
             raise SimUnicornError("Got STOP_NOSTART but a positive number of steps. This indicates a serious unicorn bug.")
 
-        addr = self.state.se.eval(self.state.ip)
+        addr = self.state.solver.eval(self.state.ip)
         l.info('finished emulation at %#x after %d steps: %s', addr, self.steps, STOP.name_stop(self.stop_reason))
 
         # should this be in destroy?
@@ -973,8 +969,8 @@ class Unicorn(SimStatePlugin):
             if 0x1000 <= address < 0x2000:
                 l.warning("Emulation touched fake GDT at 0x1000, discarding changes")
             else:
-                s = str(self.uc.mem_read(address, int(length)))
-                l.debug('...changed memory: [%#x, %#x] = %s', address, address + length, s.encode('hex'))
+                s = bytes(self.uc.mem_read(address, int(length)))
+                l.debug('...changed memory: [%#x, %#x] = %s', address, address + length, binascii.hexlify(s))
                 self.state.memory.store(address, s)
 
             p_update = update.next
@@ -1075,37 +1071,40 @@ class Unicorn(SimStatePlugin):
         uc = self.uc
 
         if self.state.arch.qemu_name == 'x86_64':
-            fs = self.state.se.eval(self.state.regs.fs)
-            gs = self.state.se.eval(self.state.regs.gs)
+            fs = self.state.solver.eval(self.state.regs.fs)
+            gs = self.state.solver.eval(self.state.regs.gs)
             self.write_msr(fs, 0xC0000100)
             self.write_msr(gs, 0xC0000101)
             flags = self._process_value(self.state.regs.eflags, 'reg')
             if flags is None:
                 raise SimValueError('symbolic eflags')
-            uc.reg_write(self._uc_const.UC_X86_REG_EFLAGS, self.state.se.eval(flags))
+            uc.reg_write(self._uc_const.UC_X86_REG_EFLAGS, self.state.solver.eval(flags))
         elif self.state.arch.qemu_name == 'i386':
             flags = self._process_value(self.state.regs.eflags, 'reg')
             if flags is None:
                 raise SimValueError('symbolic eflags')
-            uc.reg_write(self._uc_const.UC_X86_REG_EFLAGS, self.state.se.eval(flags))
-            fs = self.state.se.eval(self.state.regs.fs) << 16
-            gs = self.state.se.eval(self.state.regs.gs) << 16
-            self.setup_gdt(fs, gs)
 
-        for r, c in self._uc_regs.iteritems():
+            uc.reg_write(self._uc_const.UC_X86_REG_EFLAGS, self.state.solver.eval(flags))
+            fs = self.state.solver.eval(self.state.regs.fs) << 16
+            gs = self.state.solver.eval(self.state.regs.gs) << 16
+            gdt = self.state.project.simos.generate_gdt(fs, gs)
+            self.setup_gdt(gdt)
+
+
+        for r, c in self._uc_regs.items():
             if r in self.reg_blacklist:
                 continue
             v = self._process_value(getattr(self.state.regs, r), 'reg')
             if v is None:
                     raise SimValueError('setting a symbolic register')
-            # l.debug('setting $%s = %#x', r, self.state.se.eval(v))
-            uc.reg_write(c, self.state.se.eval(v))
+            # l.debug('setting $%s = %#x', r, self.state.solver.eval(v))
+            uc.reg_write(c, self.state.solver.eval(v))
 
         if self.state.arch.name in ('X86', 'AMD64'):
             # sync the fp clerical data
-            c3210 = self.state.se.eval(self.state.regs.fc3210)
-            top = self.state.se.eval(self.state.regs.ftop[2:0])
-            rm = self.state.se.eval(self.state.regs.fpround[1:0])
+            c3210 = self.state.solver.eval(self.state.regs.fc3210)
+            top = self.state.solver.eval(self.state.regs.ftop[2:0])
+            rm = self.state.solver.eval(self.state.regs.fpround[1:0])
             control = 0x037F | (rm << 10)
             status = (top << 11) | c3210
             uc.reg_write(unicorn.x86_const.UC_X86_REG_FPCW, control)
@@ -1116,8 +1115,8 @@ class Unicorn(SimStatePlugin):
             vex_offset = self.state.arch.registers['fpu_regs'][0]
             vex_tag_offset = self.state.arch.registers['fpu_tags'][0]
             tag_word = 0
-            for _ in xrange(8):
-                tag = self.state.se.eval(self.state.registers.load(vex_tag_offset, size=1))
+            for _ in range(8):
+                tag = self.state.solver.eval(self.state.registers.load(vex_tag_offset, size=1))
                 tag_word <<= 2
                 if tag == 0:
                     tag_word |= 3       # unicorn doesn't care about any value other than 3 for setting
@@ -1125,7 +1124,7 @@ class Unicorn(SimStatePlugin):
                     val = self._process_value(self.state.registers.load(vex_offset, size=8), 'reg')
                     if val is None:
                         raise SimValueError('setting a symbolic fp register')
-                    val = self.state.se.eval(val)
+                    val = self.state.solver.eval(val)
 
                     sign = bool(val & 0x8000000000000000)
                     exponent = (val & 0x7FF0000000000000) >> 52
@@ -1154,63 +1153,27 @@ class Unicorn(SimStatePlugin):
 
             uc.reg_write(unicorn.x86_const.UC_X86_REG_FPTAG, tag_word)
 
-    # this stuff is 100% copied from the unicorn regression tests
-    def setup_gdt(self, fs, gs, fs_size=0xFFFFFFFF, gs_size=0xFFFFFFFF):
-        GDT_ADDR = 0x1000
-        GDT_LIMIT = 0x1000
-        A_PRESENT = 0x80
-        A_DATA = 0x10
-        A_DATA_WRITABLE = 0x2
-        A_PRIV_0 = 0x0
-        A_DIR_CON_BIT = 0x4
-        F_PROT_32 = 0x4
-        S_GDT = 0x0
-        S_PRIV_0 = 0x0
-
+    def setup_gdt(self, gdt):
         uc = self.uc
 
-        uc.mem_map(GDT_ADDR, GDT_LIMIT)
-        normal_entry = self.create_gdt_entry(0, 0xFFFFFFFF, A_PRESENT | A_DATA | A_DATA_WRITABLE | A_PRIV_0 | A_DIR_CON_BIT, F_PROT_32)
-        stack_entry = self.create_gdt_entry(0, 0xFFFFFFFF, A_PRESENT | A_DATA | A_DATA_WRITABLE | A_PRIV_0, F_PROT_32)
-        fs_entry = self.create_gdt_entry(fs, fs_size, A_PRESENT | A_DATA | A_DATA_WRITABLE | A_PRIV_0 | A_DIR_CON_BIT, F_PROT_32)
-        gs_entry = self.create_gdt_entry(gs, gs_size, A_PRESENT | A_DATA | A_DATA_WRITABLE | A_PRIV_0 | A_DIR_CON_BIT, F_PROT_32)
-        uc.mem_write(GDT_ADDR + 8, normal_entry + stack_entry + fs_entry + gs_entry)
+        uc.mem_map(gdt.addr, gdt.limit)
+        uc.mem_write(gdt.addr + 8, gdt.table)
+        uc.reg_write(self._uc_const.UC_X86_REG_GDTR, (0, gdt.addr, gdt.limit, 0x0))
 
-        uc.reg_write(self._uc_const.UC_X86_REG_GDTR, (0, GDT_ADDR, GDT_LIMIT, 0x0))
+        uc.reg_write(self._uc_const.UC_X86_REG_CS, gdt.cs)
+        uc.reg_write(self._uc_const.UC_X86_REG_DS, gdt.ds)
+        uc.reg_write(self._uc_const.UC_X86_REG_ES, gdt.es)
+        uc.reg_write(self._uc_const.UC_X86_REG_SS, gdt.ss)
+        uc.reg_write(self._uc_const.UC_X86_REG_FS, gdt.fs)
+        uc.reg_write(self._uc_const.UC_X86_REG_GS, gdt.gs)
+        # if programs want to access this memory....... let them
+        # uc.mem_unmap(GDT_ADDR, GDT_LIMIT)
 
-        selector = self.create_selector(1, S_GDT | S_PRIV_0)
-        uc.reg_write(self._uc_const.UC_X86_REG_CS, selector)
-        uc.reg_write(self._uc_const.UC_X86_REG_DS, selector)
-        uc.reg_write(self._uc_const.UC_X86_REG_ES, selector)
-        selector = self.create_selector(2, S_GDT | S_PRIV_0)
-        uc.reg_write(self._uc_const.UC_X86_REG_SS, selector)
-        selector = self.create_selector(3, S_GDT | S_PRIV_0)
-        uc.reg_write(self._uc_const.UC_X86_REG_FS, selector)
-        selector = self.create_selector(4, S_GDT | S_PRIV_0)
-        uc.reg_write(self._uc_const.UC_X86_REG_GS, selector)
-        #if programs want to access this memory....... let them
-        #uc.mem_unmap(GDT_ADDR, GDT_LIMIT)
-
-    @staticmethod
-    def create_selector(idx, flags):
-        to_ret = flags
-        to_ret |= idx << 3
-        return to_ret
-
-    @staticmethod
-    def create_gdt_entry(base, limit, access, flags):
-        to_ret = limit & 0xffff
-        to_ret |= (base & 0xffffff) << 16
-        to_ret |= (access & 0xff) << 40
-        to_ret |= ((limit >> 16) & 0xf) << 48
-        to_ret |= (flags & 0xff) << 52
-        to_ret |= ((base >> 24) & 0xff) << 56
-        return struct.pack('<Q', to_ret)
 
 
     # do NOT call either of these functions in a callback, lmao
     def read_msr(self, msr=0xC0000100):
-        setup_code = '\x0f\x32'
+        setup_code = b'\x0f\x32'
         BASE = 0x100B000000
 
         uc = self.uc
@@ -1225,7 +1188,7 @@ class Unicorn(SimStatePlugin):
         return (d << 32) + a
 
     def write_msr(self, val, msr=0xC0000100):
-        setup_code = '\x0f\x30'
+        setup_code = b'\x0f\x30'
         BASE = 0x100B000000
 
         uc = self.uc
@@ -1255,7 +1218,7 @@ class Unicorn(SimStatePlugin):
             for i in sorted(symbolic_list[:num_regs]):
                 if cur_group is None:
                     cur_group = i
-                elif i != last + 1 or cur_group/self.state.arch.bytes != i/self.state.arch.bytes:
+                elif i != last + 1 or cur_group//self.state.arch.bytes != i//self.state.arch.bytes:
                     saved_registers.append((
                         cur_group, self.state.registers.load(cur_group, last-cur_group+1)
                     ))
@@ -1267,7 +1230,7 @@ class Unicorn(SimStatePlugin):
                 ))
 
         # now we sync registers out of unicorn
-        for r, c in self._uc_regs.iteritems():
+        for r, c in self._uc_regs.items():
             if r in self.reg_blacklist:
                 continue
             v = self.uc.reg_read(c)
@@ -1280,7 +1243,7 @@ class Unicorn(SimStatePlugin):
                 self.state.registers.store('ip_at_syscall', self.state.regs.ip - 2)
 
             # update the eflags
-            self.state.regs.eflags = self.state.se.BVV(self.uc.reg_read(self._uc_const.UC_X86_REG_EFLAGS), self.state.arch.bits)
+            self.state.regs.eflags = self.state.solver.BVV(self.uc.reg_read(self._uc_const.UC_X86_REG_EFLAGS), self.state.arch.bits)
 
             # sync the fp clerical data
             status = self.uc.reg_read(unicorn.x86_const.UC_X86_REG_FPSW)
@@ -1299,7 +1262,7 @@ class Unicorn(SimStatePlugin):
             vex_tag_offset = self.state.arch.registers['fpu_tags'][0] + 7
             tag_word = self.uc.reg_read(unicorn.x86_const.UC_X86_REG_FPTAG)
 
-            for _ in xrange(8):
+            for _ in range(8):
                 if tag_word & 3 == 3:
                     self.state.registers.store(vex_tag_offset, 0, size=1)
                 else:
@@ -1344,7 +1307,7 @@ class Unicorn(SimStatePlugin):
 
     def _check_registers(self, report=True):
         ''' check if this state might be used in unicorn (has no concrete register)'''
-        for r in self.state.arch.uc_regs.iterkeys():
+        for r in self.state.arch.uc_regs.keys():
             v = getattr(self.state.regs, r)
             processed_v = self._process_value(v, 'reg')
             if processed_v is None or processed_v.symbolic:

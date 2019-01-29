@@ -4,13 +4,12 @@ import contextlib
 import weakref
 
 import logging
-l = logging.getLogger("angr.sim_state")
+l = logging.getLogger(name=__name__)
 
+import angr # type annotations; pylint:disable=unused-import
 import claripy
-import ana
-from archinfo import arch_from_id
+import archinfo
 
-from .misc.ux import deprecated
 from .misc.plugins import PluginHub, PluginPreset
 from .sim_state_options import SimStateOptions
 
@@ -27,10 +26,15 @@ def arch_overrideable(f):
 # This is a counter for the state-merging symbolic variables
 merge_counter = itertools.count()
 
+_complained_se = False
+
 # pylint: disable=not-callable
-class SimState(PluginHub, ana.Storable):
+class SimState(PluginHub):
     """
     The SimState represents the state of a program, including its memory, registers, and so forth.
+
+    :param angr.Project project:
+    :param archinfo.Arch arch:
 
     :ivar regs:         A convenient view of the state's registers, where each register is a property
     :ivar mem:          A convenient view of the state's memory, a :class:`angr.state_plugins.view.SimMemView`
@@ -45,17 +49,19 @@ class SimState(PluginHub, ana.Storable):
     :ivar libc:         Information about the standard library we are emulating
     :ivar cgc:          Information about the cgc environment
     :ivar uc_manager:   Control of under-constrained symbolic execution
-    :ivar unicorn:      Control of the Unicorn Engine
+    :ivar str unicorn:      Control of the Unicorn Engine
     """
 
     def __init__(self, project=None, arch=None, plugins=None, memory_backer=None, permissions_backer=None, mode=None, options=None,
-                 add_options=None, remove_options=None, special_memory_filler=None, os_name=None, plugin_preset='default'):
+                 add_options=None, remove_options=None, special_memory_filler=None, os_name=None, plugin_preset='default', **kwargs):
+        if kwargs:
+            l.warning("Unused keyword arguments passed to SimState: %s", " ".join(kwargs))
         super(SimState, self).__init__()
         self.project = project
         self.arch = arch if arch is not None else project.arch.copy() if project is not None else None
 
         if type(self.arch) is str:
-            self.arch = arch_from_id(self.arch)
+            self.arch = archinfo.arch_from_id(self.arch)
 
         # the options
         if options is None:
@@ -77,9 +83,9 @@ class SimState(PluginHub, ana.Storable):
             self.use_plugin_preset(plugin_preset)
 
         if plugins is not None:
-            for n,p in plugins.iteritems():
+            for n,p in plugins.items():
                 self.register_plugin(n, p, inhibit_init=True)
-            for p in plugins.itervalues():
+            for p in plugins.values():
                 p.init_state()
 
         if not self.has_plugin('memory'):
@@ -133,10 +139,6 @@ class SimState(PluginHub, ana.Storable):
         # This is used in static mode as we don't have any constraints there
         self._satisfiable = True
 
-        # states are big, so let's give them UUIDs for ANA right away to avoid
-        # extra pickling
-        self.make_uuid()
-
         self.uninitialized_access_handler = None
         self._special_memory_filler = special_memory_filler
 
@@ -144,14 +146,13 @@ class SimState(PluginHub, ana.Storable):
         self._global_condition = None
         self.ip_constraints = []
 
-    def _ana_getstate(self):
-        s = dict(ana.Storable._ana_getstate(self))
-        s = { k:v for k,v in s.iteritems() if k not in ('inspect', 'regs', 'mem')}
-        s['_active_plugins'] = { k:v for k,v in s['_active_plugins'].iteritems() if k not in ('inspect', 'regs', 'mem') }
+    def __getstate__(self):
+        s = { k:v for k,v in self.__dict__.items() if k not in ('inspect', 'regs', 'mem')}
+        s['_active_plugins'] = { k:v for k,v in s['_active_plugins'].items() if k not in ('inspect', 'regs', 'mem') }
         return s
 
-    def _ana_setstate(self, s):
-        ana.Storable._ana_setstate(self, s)
+    def __setstate__(self, s):
+        self.__dict__.update(s)
         for p in self.plugins.values():
             p.set_state(self)
             if p.STRONGREF_STATE:
@@ -182,7 +183,13 @@ class SimState(PluginHub, ana.Storable):
 
     @property
     def se(self):
-        # TODO: Deprecate this
+        """
+        Deprecated alias for `solver`
+        """
+        global _complained_se
+        if not _complained_se:
+            _complained_se = True
+            l.critical("The name state.se is deprecated; please use state.solver.")
         return self.get_plugin('solver')
 
     @property
@@ -420,7 +427,7 @@ class SimState(PluginHub, ana.Storable):
     def _copy_plugins(self):
         memo = {}
         out = {}
-        for n, p in self._active_plugins.iteritems():
+        for n, p in self._active_plugins.items():
             if id(p) in memo:
                 out[n] = memo[id(p)]
             else:
@@ -476,7 +483,7 @@ class SimState(PluginHub, ana.Storable):
 
         if merge_conditions is None:
             # TODO: maybe make the length of this smaller? Maybe: math.ceil(math.log(len(others)+1, 2))
-            merge_flag = self.solver.BVS("state_merge_%d" % merge_counter.next(), 16)
+            merge_flag = self.solver.BVS("state_merge_%d" % next(merge_counter), 16)
             merge_values = range(len(others)+1)
             merge_conditions = [ merge_flag == b for b in merge_values ]
         else:
@@ -611,7 +618,7 @@ class SimState(PluginHub, ana.Storable):
         """
         sp = self.regs.sp
         self.regs.sp = sp - self.arch.stack_change
-        return self.memory.load(sp, self.arch.bits / 8, endness=self.arch.memory_endness)
+        return self.memory.load(sp, self.arch.bytes, endness=self.arch.memory_endness)
 
     @arch_overrideable
     def stack_read(self, offset, length, bp=False):
@@ -630,7 +637,7 @@ class SimState(PluginHub, ana.Storable):
     ###############################
 
     def make_concrete_int(self, expr):
-        if isinstance(expr, (int, long)):
+        if isinstance(expr, int):
             return expr
 
         if not self.solver.symbolic(expr):
@@ -674,7 +681,7 @@ class SimState(PluginHub, ana.Storable):
         current stack frame (from sp to bp) will be printed out.
         """
 
-        var_size = self.arch.bits / 8
+        var_size = self.arch.bytes
         sp_sim = self.regs._sp
         bp_sim = self.regs._bp
         if self.solver.symbolic(sp_sim) and sp is None:
@@ -691,9 +698,9 @@ class SimState(PluginHub, ana.Storable):
                 result = "SP = 0x%08x, BP = 0x%08x\n" % (sp_value, bp_value)
             if depth is None:
                 # bp_value cannot be None here
-                depth = (bp_value - sp_value) / var_size + 1 # Print one more value
+                depth = (bp_value - sp_value) // var_size + 1 # Print one more value
             pointer_value = sp_value
-            for i in xrange(depth):
+            for i in range(depth):
                 # For AbstractMemory, we wanna utilize more information from VSA
                 stack_values = [ ]
 
@@ -779,66 +786,6 @@ class SimState(PluginHub, ana.Storable):
         else:
             return conditions.__class__((self._adjust_condition(self.solver.And(*conditions)),))
 
-    #
-    # Compatibility layer
-    #
-
-    @property
-    def state(self):
-        return self
-
-    @property
-    def length(self):
-        return self.history.block_count
-
-    @property
-    def jumpkind(self):
-        return self.history.jumpkind
-
-    @property
-    def last_actions(self):
-        return self.history.recent_actions
-
-    @property
-    def history_iterator(self):
-        return self.history.lineage
-
-    @property
-    def addr_trace(self):
-        return self.history.addr_trace
-
-    @property
-    def trace(self):
-        return self.history.trace
-
-    @property
-    def targets(self):
-        return self.history.jump_targets
-
-    @property
-    def guards(self):
-        return self.history.jump_guards
-
-    @property
-    def jumpkinds(self):
-        return self.history.jumpkinds
-
-    @property
-    def events(self):
-        return self.history.events
-
-    @property
-    def actions(self):
-        return self.history.actions
-
-    @property
-    def reachable(self):
-        return self.history.reachable()
-
-    @deprecated()
-    def trim_history(self):
-        self.history.trim()
-
 default_state_plugin_preset = PluginPreset()
 SimState.register_preset('default', default_state_plugin_preset)
 
@@ -847,4 +794,4 @@ from .state_plugins.inspect import BP_AFTER, BP_BEFORE
 from .state_plugins.sim_action import SimActionConstraint
 
 from . import sim_options as o
-from .errors import SimMergeError, SimValueError, SimStateError, SimSolverModeError, AngrNoPluginError
+from .errors import SimMergeError, SimValueError, SimStateError, SimSolverModeError

@@ -1,6 +1,6 @@
 import angr
 import logging
-l = logging.getLogger("angr.engines.syscall")
+l = logging.getLogger(name=__name__)
 
 from .engine import SimEngine
 
@@ -28,7 +28,7 @@ class SimEngineSyscall(SimEngine):
 
                 sys_procedure = angr.SIM_PROCEDURES['stubs']['syscall'](cc=cc)
 
-        addr = state.se.eval(state._ip)
+        addr = state.solver.eval(state._ip)
         return self.project.factory.procedure_engine.process(state, sys_procedure, force_addr=addr)
 
 from ..errors import AngrUnsupportedSyscallError

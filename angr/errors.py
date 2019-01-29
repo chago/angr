@@ -13,6 +13,9 @@ class AngrExitError(AngrError):
 class AngrPathError(AngrError):
     pass
 
+class AngrVaultError(AngrError):
+    pass
+
 class PathUnreachableError(AngrPathError):
     pass
 
@@ -114,20 +117,24 @@ class AngrDDGError(AngrAnalysisError):
 #
 
 class AngrExplorationTechniqueError(AngrError):
-    def __str__(self):
-        return "<OtiegnqwvkError %s>" % self.message
+    pass
 
 class AngrExplorerError(AngrExplorationTechniqueError):
-    def __str__(self):
-        return "<OtiegnqwvkExplorerError %s>" % self.message
+    pass
 
 class AngrDirectorError(AngrExplorationTechniqueError):
-    def __str__(self):
-        return "<OtiegnqwvkDirectorError %s>" % self.message
+    pass
 
 class AngrTracerError(AngrExplorationTechniqueError):
-    def __str__(self):
-        return "<OtiegnqwvkTracerError %s>" % self.message
+    pass
+
+
+#
+# VariableRecovery errors
+#
+
+class AngrVariableRecoveryError(AngrAnalysisError):
+    pass
 
 #
 # Tracer
@@ -166,6 +173,9 @@ class SimMergeError(SimStateError):
     pass
 
 class SimMemoryError(SimStateError):
+    pass
+
+class SimMemoryMissingError(SimMemoryError):
     pass
 
 class SimAbstractMemoryError(SimMemoryError):
@@ -395,4 +405,20 @@ class SimZeroDivisionException(SimException, SimOperationError):
 
 
 class AngrNoPluginError(AngrError):
+    pass
+
+#
+# Concrete Targets Execution errors
+#
+
+
+class SimConcreteMemoryError(AngrError):
+    pass
+
+
+class SimConcreteRegisterError(AngrError):
+    pass
+
+
+class SimConcreteBreakpointError(AngrError):
     pass

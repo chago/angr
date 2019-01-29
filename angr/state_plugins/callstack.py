@@ -6,7 +6,7 @@ import logging
 from .plugin import SimStatePlugin
 from ..errors import AngrError, SimEmptyCallStackError
 
-l = logging.getLogger("angr.state_plugins.callstack")
+l = logging.getLogger(name=__name__)
 
 class CallStack(SimStatePlugin):
     """
@@ -209,7 +209,7 @@ class CallStack(SimStatePlugin):
 
         try:
             return dropwhile(lambda x: lst[x] != item,
-                             reversed(xrange(len(lst)))).next()
+                             next(reversed(range(len(lst)))))
         except Exception:
             raise ValueError("%s not in the list" % item)
 
